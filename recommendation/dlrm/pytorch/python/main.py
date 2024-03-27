@@ -23,6 +23,11 @@ import numpy as np
 import dataset
 import criteo
 
+import torch
+from torch.profiler import profile as perf, record_function, ProfilerActivity
+from pathlib import Path
+import time
+
 # add dlrm code path
 try:
     dlrm_dir_path = os.environ['DLRM_DIR']
@@ -327,21 +332,47 @@ class RunnerBase:
         self.threads = threads
         self.max_batchsize = max_batchsize
         self.result_timing = []
+        self.first_run = True
+        self.count = 0
+        self.total_time = 0
 
     def handle_tasks(self, tasks_queue):
         pass
 
-    def start_run(self, result_dict, take_accuracy):
+    def start_run(self, result_dict, take_accuracy, prof):
         self.result_dict = result_dict
         self.result_timing = []
         self.take_accuracy = take_accuracy
         self.post_process.start()
+        self.prof = prof
 
     def run_one_item(self, qitem):
         # run the prediction
         processed_results = []
         try:
+            self.count += 1
+            #start_time = time.time()
+            # if self.count <= 3:
+            #     print("=============== Starting the prediction and profiling ===================")
+            #     ######## profile the one batch prediction #########
+            #     with perf(record_shapes=True, with_stack=True, profile_memory=False) as prof:
+            #             with record_function("model_inference"):
+            #                 results = self.model.predict(qitem.batch_dense_X, qitem.batch_lS_o, qitem.batch_lS_i)
+            
+            #     print("=============== Finished prediction and profiling ===================")
+            #     home = str(Path.home())
+            #     prof.export_chrome_trace(f"/{home}/mlperf/profiling_results_{self.count}.json")
+            #     # print(prof.key_averages(group_by_stack_n=20, group_by_input_shape=True).table(sort_by="self_cpu_time_total", row_limit=50))
+            #     print(prof.key_averages(group_by_input_shape=True).table(sort_by='self_cpu_time_total', row_limit=200))
+            #     self.first_run = False
+
+            # else:
             results = self.model.predict(qitem.batch_dense_X, qitem.batch_lS_o, qitem.batch_lS_i)
+            #end_time = time.time()
+            #execution_time = end_time - start_time
+            #self.total_time += execution_time
+            #print(f"================= Finished prediction {self.count} @344 - {execution_time} {self.total_time} ==================")
+ 
             processed_results = self.post_process(results, qitem.batch_T, self.result_dict)
             if self.take_accuracy:
                 self.post_process.add_results(processed_results)
@@ -372,12 +403,15 @@ class RunnerBase:
         idx = [q.index for q in query_samples]
         query_id = [q.id for q in query_samples]
         query_len = len(query_samples)
+        # print(f" !!!!!!!!!!!running enqueue from runnerbase !!!!!!!!!!!!! {query_len}, {self.max_batchsize}")
 
         if query_len < self.max_batchsize:
             batch_dense_X, batch_lS_o, batch_lS_i, batch_T, idx_offsets = self.ds.get_samples(idx)
             self.run_one_item(Item(query_id, idx, batch_dense_X, batch_lS_o, batch_lS_i, batch_T, idx_offsets))
+            self.prof.step()
         else:
             bs = self.max_batchsize
+            # print(f" !!!!!!!!!!!running else block in enqueue from runnerbase !!!!!!!!!!!!! {query_len}")
             for i in range(0, query_len, bs):
                 ie = min(i + bs, query_len)
                 batch_dense_X, batch_lS_o, batch_lS_i, batch_T, idx_offsets = self.ds.get_samples(idx[i:ie])
@@ -530,6 +564,8 @@ def main():
     # warmup
     ds.load_query_samples([0])
 
+    print("================= Running prediction @533 ==================")
+
     for _ in range(5):
         batch_dense_X, batch_lS_o, batch_lS_i, _, _ = ds.get_samples([0])
         _ = backend.predict(batch_dense_X, batch_lS_o, batch_lS_i)
@@ -547,6 +583,7 @@ def main():
     runner = runner_map[scenario](model, ds, args.threads, post_proc=post_proc, max_batchsize=args.max_batchsize)
 
     def issue_queries(query_samples):
+        # this invokes the predict at line @344 once per a query if query_len is 1
         runner.enqueue(query_samples)
 
     def flush_queries():
@@ -588,8 +625,18 @@ def main():
 
     log.info("starting {}".format(scenario))
     result_dict = {"good": 0, "total": 0, "roc_auc": 0, "scenario": str(scenario)}
-    runner.start_run(result_dict, args.accuracy)
-    lg.StartTest(sut, qsl, settings)
+
+
+    print("=============== Starting the prediction and profiling ===================")
+    ####### profile the entire prediction #########
+    with perf(record_shapes=True, with_stack=True, profile_memory=False, schedule=torch.profiler.schedule(
+        wait=2, # During this phase profiler is not active.
+        warmup=3, # During this phase profiler starts tracing, but the results are discarded.
+        active=50, # During this phase profiler traces and records data.
+        repeat=1)) as prof:
+        runner.start_run(result_dict, args.accuracy, prof)
+        lg.StartTest(sut, qsl, settings)
+    print(prof.key_averages(group_by_input_shape=True).table(sort_by='self_cpu_time_total', row_limit=200))
 
     result_dict["good"] = runner.post_process.good
     result_dict["total"] = runner.post_process.total
